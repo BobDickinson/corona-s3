@@ -26,32 +26,35 @@ WARNING:
 
     FOR TEST ONLY - DO NOT USE IN RELEASED APPLICATIONS!
 
-    This module currently uses the Lua Sockets networking interfaces.  These are
-    very well-designed and robust interfaces, but unfortunately they are all 
-    synchronous/blocking calls.  Some Lua environments provide multitasking (via
-    LuaLanes and other methods), and in those environments the Lua Sockets interfaces
-    are a perfectly reasonable solution.  Unfortunately, Corona does not provide
-    any multitasking support, and all application code is executed on the main user
-    interface thread.  This means that your app will be completely non-responsive
-    for the duration of any network call.  Since Corona apps often run on mobile devices
-    with slow or unreliable data connections, this means that your app can hang for a
-    very long time (up to the platform-specific timeout, typically 30 seconds to a minute
-    for a complete failure, but it could be significantly longer if the I/O doesn't 
+    This module currently uses the Lua Sockets networking interfaces.  These 
+    are very well-designed and robust interfaces, but unfortunately they are 
+    all synchronous/blocking calls.  Some Lua environments provide multitasking
+    (via LuaLanes and other methods), and in those environments the Lua Sockets 
+    interfaces are a perfectly reasonable solution.  Unfortunately, Corona does
+    not provide any multitasking support, and all application code is executed
+    on the main user interface thread.  This means that your app will be 
+    completely non-responsive for the duration of any network call.  Since 
+    Corona apps often run on mobile devices with slow or unreliable data 
+    connections, this means that your app can hang for a very long time (up to
+    the platform-specific timeout, typically 30 seconds to a minute for a 
+    complete failure, but it could be significantly longer if the I/O doesn't 
     fail, but just takes a really long time to complete).
 
-    It is not a good idea to use the code below (or really, any code that uses the blocking
-    I/O) in a production application, given that no decent app should ever be non-responsive
-    for any significant period of time (even a download of a smallish file over a fast WIFI
-    connection can take 5-10 seconds, and that's if everything goes well).
+    It is not a good idea to use the code below (or really, any code that uses
+    the blocking I/O) in a production application, given that no decent app 
+    should ever be non-responsive for any significant period of time (even a
+    download of a smallish file over a fast WIFI connection can take 5-10 
+    seconds, and that's if everything goes well).
 
-    I am using this code for testing currently.  I have found the asynchronous I/O support 
-    in Corona to be unusable for talking to REST APIs like S3 (they don't support the
-    required verbs such as HEAD, PUT, and DELETE, and they don't provide access to the
-    HTTP response code, status, or headers, all of which are needed to interact with a 
-    REST service in a meaningful way).  I have entered a feature request to have this 
-    functionality added to the Corona async network.request method, and my hope is that
-    they will be added soon so that I can update this module and deploy S3 support in my
-    released application.  I originally attempted to at least support bucket list/get using 
-    the async network.request with GET, but found it to be buggy (it was non-functional
-    on Windows, and produced corrupt files on Android).  I submitted a bug report regarding
-    these bahviors.
+    I am using this code for testing currently.  I have found the asynchronous
+    I/O support in Corona to be unusable for talking to REST APIs like S3 (they
+    don't support the required verbs such as HEAD, PUT, and DELETE, and they 
+    don't provide access to the HTTP response code, status, or headers, all of
+    which are needed to interact with a REST service in a meaningful way).  I 
+    have entered a feature request to have this functionality added to the 
+    Corona async network.request method, and my hope is that they will be added
+    soon so that I can update this module and deploy S3 support in my released
+    application.  I originally attempted to at least support bucket list/get 
+    using the async network.request with GET, but found it to be buggy (it was 
+    non-functional on Windows, and produced corrupt files on Android).  I 
+    submitted a bug report regarding these bahviors.
