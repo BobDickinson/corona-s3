@@ -11,8 +11,8 @@ local function s3_test( )
 
     s3.isDebug = true
 
-    s3.AWS_Access_Key_ID = "_YOUR_ACCESS_KEY_GOES_HERE_"
-    s3.AWS_Secret_Key    = "_YOUR_SECRET_KEY_GOES_HERE_"
+    --s3.AWS_Access_Key_ID = "_YOUR_ACCESS_KEY_GOES_HERE_"
+    --s3.AWS_Secret_Key    = "_YOUR_SECRET_KEY_GOES_HERE_"
 
     s3.testAll()
     

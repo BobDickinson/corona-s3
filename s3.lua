@@ -32,61 +32,6 @@
 --        http://aws.amazon.com/s3/
 --        http://www.anscamobile.com/corona/
 --
--- WARNING: 
---
---    FOR TEST ONLY - DO NOT USE IN RELEASED APPLICATIONS!
---
---    This module currently uses the Lua Sockets networking interfaces.  These are
---    very well-designed and robust interfaces, but unfortunately they are all 
---    synchronous/blocking calls.  Some Lua environments provide multitasking (via
---    LuaLanes and other methods), and in those environments the Lua Sockets interfaces
---    are a perfectly reasonable solution.  Unfortunately, Corona does not provide
---    any multitasking support, and all application code is executed on the main user
---    interface thread.  This means that your app will be completely non-responsive
---    for the duration of any network call.  Since Corona apps often run on mobile devices
---    with slow or unreliable data connections, this means that your app can hang for a
---    very long time (up to the platform-specific timeout, typically 30 seconds to a minute
---    for a complete failure, but it could be significantly longer if the I/O doesn't 
---    fail, but just takes a really long time to complete).
---
---    It is not a good idea to use the code below (or really, any code that uses the blocking
---    I/O) in a production application, given that no decent app should ever be non-responsive
---    for any significant period of time (even a download of a smallish file over a fast WIFI
---    connection can take 5-10 seconds, and that's if everything goes well).
---
---    I am using this code for testing currently.  I have found the asynchronous I/O support 
---    in Corona to be unusable for talking to REST APIs like S3 (they don't support the
---    required verbs such as HEAD, PUT, and DELETE, and they don't provide access to the
---    HTTP response code, status, or headers, all of which are needed to interact with a 
---    REST service in a meaningful way).  I have entered a feature request to have this 
---    functionality added to the Corona async network.request method, and my hope is that
---    they will be added soon so that I can update this module and deploy S3 support in my
---    released application.  I originally attempted to at least support bucket list/get using 
---    the async network.request with GET, but found it to be buggy (it was non-functional
---    on Windows, and produced corrupt files on Android).  I submitted a bug report regarding
---    these bahviors.
---
--- To Do:
---
---    Add bucket:head( ) support (determine object existence, get metadata)
---
---    Add support for getting response headers (and associated metadata) on bucket:get( )
---
---    Add bucket:delete( ) to delete object in bucket
---
---    Implement asynchronous network I/O when/if functionality provided in Corona
---
--- Testing Notes:
---
---    The unit tests below have been trimmed down substantially.  Since Amazon doesn't have
---    any kind of test account or test fixture for S3, you will have to test against your own
---    S3 bucket/account.  The original local version of my tests uploaded and downloaded files
---    and compared against reference files in order to validate.  They also validated the bucket
---    contents on list().  
---
---    For the sake of optimization, you will probably want to comment out the entire test block
---    at the end of this module when your testing is complete.
---
 -- Usage:
 --
 --    local s3 = require("s3")
@@ -98,14 +43,70 @@
 --    -- Get a bucket object
 --    local bucket = s3.getBucket("bucketName")
 --
---    -- List bucket contents, Get and Put files
+--    -- Get bucket contents
 --    --
---    local bucket_contents = bucket:list("/", "path/", 100)
---    local object_data = bucket:get("path/object.txt")
---    bucket:put("path/object.txt", "this is the object contents")
+--    local status = bucket:list("/", "path/", 100)
+--    print("Found " .. #status.bucket.Contents .. " .. items in bucket")
+--
+--    -- Put a file, get it back, and delete it
+--    --
+--    bucket:put("path/object.txt", nil, "this is the object contents")
+--    status = bucket:get("path/object.txt")
+--    if not status.isError and status.response.code = 200 then
+--        print("Got bucket object contents: " .. status.response.body)
+--    end    
+--    bucket:delete("path/object.txt")
+--
+--
+-- Notice: 
+--
+--    This module currently uses the LuaSocket networking interfaces.  These are
+--    very well-designed and robust interfaces, but unfortunately they are all 
+--    synchronous/blocking calls.  Some Lua environments provide multitasking (via
+--    LuaLanes and other methods), and in those environments the LuaSocket interfaces
+--    are a perfectly reasonable solution.  Unfortunately, Corona does not provide
+--    any multitasking support, and all application code is executed on the main user
+--    interface thread (meaning that your application will be non-responsive during
+--    network I/O).
+--
+--    In order to support asynchronouse/cancellable network I/O, this module uses a 
+--    technique designed by Diego Nehab (the creator of LuaSocket) and implemented
+--    in the Lua module "dispatch".  It essentially blocks for 100ms at a time and
+--    yeilds back to the main event thread.  You may notice some slight jerkiness if
+--    there is a lot of UI activity happening during your network I/O, but in most 
+--    cases this approach seems to work fine.  I'd like to thank Le Viet Bach of 
+--    Rubycell .JSC for his original implementation of an http request using the 
+--    dispatch method (in his "asyncHttp" module, a version of which is used here
+--    as "async_http").
+--
+--    It would be preferrable to use the Corona asynchronous I/O support, as it is
+--    truly asynchronous and supports https, but it is currently unusable for talking
+--    to REST APIs like S3 (no support for the required verbs such as HEAD, PUT, and
+--    DELETE, and no access to the HTTP response code, status, or headers, all of
+--    which are needed to interact with a REST service in a meaningful way).  I have
+--    entered a feature request to have this functionality added to the Corona async
+--    network.request method.  I originally attempted to at least support bucket
+--    list/get using the async network.request with GET, but found it to be buggy (it
+--    was non-functional on Windows, and produced corrupt files on Android).  I submitted
+--    a bug report regarding these bahviors.  If the Corona asynchronous I/O support
+--    is ever improved to support the required functionality, and it is stable on all
+--    platforms, then I will update the asynchronous request logic here to use it.
+--
+-- Testing Notes:
+--
+--    The unit tests below have been trimmed down substantially and will not work in
+--    your local environment without modification.  Since Amazon doesn't have any
+--    kind of test account or test fixture for S3, you will have to test against your
+--    own S3 bucket/account (and modify the tests accordingly).  
+--
+--    For the sake of optimization, you will probably want to comment out the entire test
+--    block at the end of this module when your testing is complete.
 --
 --====================================================================--
+--
 local M = {}
+
+local asynch_http = require("async_http")
 
 local crypto = require("crypto")
 local mime = require("mime")
@@ -121,7 +122,7 @@ local sha1 = require("sha1") -- Pure Lua - Used for Windows sim only
 --
 local PROXY -- = "http://127.0.0.1:8888"
 
--- These should be set outside of this module, but the user of the module
+-- These should be set outside of this module, by the user of the module
 M.AWS_Access_Key_ID = "--UNDEFINED--"
 M.AWS_Secret_Key    = "--UNDEFINED--"
 
@@ -180,13 +181,20 @@ local function addAuthorizationHeader( method, bucketName, objectName, headers )
 
 end
 
-local function getHeaders(content)
+local function getHeaders(user_headers, content)
     local headers = {}
     headers["Date"] = os.date("!%a, %d %b %Y %H:%M:%S GMT")
     
     if content then
         headers["Content-Length"] = content:len()
         headers["Content-MD5"] = mime.b64(crypto.digest(crypto.md5, content, true))
+    end
+    
+    -- Add caller-supplied headers (if any)
+    if user_headers then
+        for header, value in pairs(user_headers) do
+            headers[header] = value
+        end
     end
 
     return headers
@@ -240,21 +248,23 @@ local function dumpHttpRequestResponse( httpRequest, httpResponse )
             dbgf("HTTP request header - %s: %s", header, value)
         end
         
-        -- Dump response
-        if type(httpResponse.code) == "string" then
-            -- Certain failures that don't produce an HTTP response at all (like "connection refused")
-            -- result in an error string in the response.code.
-            dbgf("HTTP response: %s", httpResponse.code)
-        else
-            dbgf("HTTP response: %i %s", httpResponse.code, httpResponse.status)
-        end
-        for header, value in pairs(httpResponse.headers) do
-            dbgf("HTTP response header - %s: %s", header, value)
-        end
-        
-        local ct = httpResponse.headers["content-type"]
-        if httpResponse.body and (ct == "application/xml" or ct == "text/plain") then
-            dbg("HTTP response body:" .. httpResponse.body)
+        if httpResponse then
+            -- Dump response
+            if type(httpResponse.code) == "string" then
+                -- Certain failures that don't produce an HTTP response at all (like "connection refused")
+                -- result in an error string in the response.code.
+                dbgf("HTTP response: %s", httpResponse.code)
+            else
+                dbgf("HTTP response: %i %s", httpResponse.code, httpResponse.status)
+            end
+            for header, value in pairs(httpResponse.headers) do
+                dbgf("HTTP response header - %s: %s", header, value)
+            end
+            
+            local ct = httpResponse.headers["content-type"]
+            if httpResponse.body and (ct == "application/xml" or ct == "text/plain") then
+                dbg("HTTP response body:" .. httpResponse.body)
+            end
         end
     end
 end
@@ -327,9 +337,41 @@ end
 --
 --    bucket = s3.getBucket("bucketName")
 --
---    bucket:list() - "GET Bucket" (List objects) 
---    bucket:get()  - "GET Object"
---    bucket:put()  - "PUT Object"
+--    bucket:list()   - "GET Bucket" (List objects) 
+--    bucket:head()   - "HEAD Object"
+--    bucket:get()    - "GET Object"
+--    bucket:put()    - "PUT Object"
+--    bucket:delete() - "DELETE Object"
+--
+--    All methods produce a status, as follows:
+--
+--      status
+--        isError - true or false
+--        errorMessage - error message, if isError is true
+--        request - the http request constructed for the call
+--          url - the url
+--          method - the method, such as GET or POST
+--          headers - the http request headers
+--          body - the http request body (if any)
+--        response - if isError is false, the http response
+--          code - response code, such as 200 for success
+--          status - resonse status string, such as "OK" or "Not Found"
+--          headers - response headers
+--          body - response body (if any)
+--
+--    All methods can be called synchronously or asynchronously, as follows:
+--
+--     * If no onComplete callback is provided, then the method blocks while
+--       completing the request and returns the status to the caller.
+--
+--     * If an onComplete callback is provided, then the method will perform the
+--       request asynchronously, returning a cancellable thread reference.  When the
+--       request is completed, the onComplete callback will be called with the status.
+--
+--       An asynchronous request can be cancelled as follow:
+--
+--         local http_thread = bucket:get("boulder.png", nil, onComplete)
+--         http_thread:cancel()
 --
 --------------------------------------------------------------------------------
 --
@@ -341,13 +383,13 @@ function M.getBucket( bucketName )
     }
     
     ----------------------------------------------------------------------------
-    -- Method: s3_bucket:list( delimiter, prefix, max_keys, marker )
+    -- Method: s3_bucket:list( delimiter, prefix, max_keys, marker, onComplete )
     --
     -- See: http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTBucketGET.html
     --
     -- Example:
     --
-    --    local result = bucket:list("/", "users/", 100)
+    --    local status = bucket:list("/", "users/", 100)
     --
     -- When called on a bucket with the following contents:
     --
@@ -356,41 +398,43 @@ function M.getBucket( bucketName )
     --    /users/matt/
     --    /users/episodes.json
     --
-    -- Produces this result:
+    -- Produces this status:
     --
-    --    result.xmlns = http://s3.amazonaws.com/doc/2006-03-01/
-    --    result.Name = BucketName
-    --    result.MaxKeys = 100
-    --    result.Prefix = users/
-    --    result.Delimiter = /
-    --    result.Contents[1].LastModified = 2012-02-22T06:53:49.000Z
-    --    result.Contents[1].Key = users/
-    --    result.Contents[1].StorageClass = STANDARD
-    --    result.Contents[1].ETag = "xxxxxxxxxxxxxxxxxxxxxxxx"
-    --    result.Contents[1].Owner.ID = xxxxxxxxxxxxxxxxxxxxxxxx
-    --    result.Contents[1].Owner.DisplayName = xxxxxx
-    --    result.Contents[1].Size = 0
-    --    result.Contents[2].LastModified = 2012-02-22T06:55:12.000Z
-    --    result.Contents[2].Key = users/episodes.json
-    --    result.Contents[2].StorageClass = STANDARD
-    --    result.Contents[2].ETag = "xxxxxxxxxxxxxxxxxxxxxxxx"
-    --    result.Contents[2].Owner.ID = xxxxxxxxxxxxxxxxxxxxxxxx
-    --    result.Contents[2].Owner.DisplayName = xxxxxx
-    --    result.Contents[2].Size = 114
-    --    result.CommonPrefixes[1].Prefix = users/bob/
-    --    result.CommonPrefixes[2].Prefix = users/matt/
-    --    result.Marker =
-    --    result.IsTruncated = false  
+    --    status.isError = false
+    --    status.bucket.xmlns = http://s3.amazonaws.com/doc/2006-03-01/
+    --    status.bucket.Name = BucketName
+    --    status.bucket.MaxKeys = 100
+    --    status.bucket.Prefix = users/
+    --    status.bucket.Delimiter = /
+    --    status.bucket.Contents[1].LastModified = 2012-02-22T06:53:49.000Z
+    --    status.bucket.Contents[1].Key = users/
+    --    status.bucket.Contents[1].StorageClass = STANDARD
+    --    status.bucket.Contents[1].ETag = "xxxxxxxxxxxxxxxxxxxxxxxx"
+    --    status.bucket.Contents[1].Owner.ID = xxxxxxxxxxxxxxxxxxxxxxxx
+    --    status.bucket.Contents[1].Owner.DisplayName = xxxxxx
+    --    status.bucket.Contents[1].Size = 0
+    --    status.bucket.Contents[2].LastModified = 2012-02-22T06:55:12.000Z
+    --    status.bucket.Contents[2].Key = users/episodes.json
+    --    status.bucket.Contents[2].StorageClass = STANDARD
+    --    status.bucket.Contents[2].ETag = "xxxxxxxxxxxxxxxxxxxxxxxx"
+    --    status.bucket.Contents[2].Owner.ID = xxxxxxxxxxxxxxxxxxxxxxxx
+    --    status.bucket.Contents[2].Owner.DisplayName = xxxxxx
+    --    status.bucket.Contents[2].Size = 114
+    --    status.bucket.CommonPrefixes[1].Prefix = users/bob/
+    --    status.bucket.CommonPrefixes[2].Prefix = users/matt/
+    --    status.bucket.Marker =
+    --    status.bucket.IsTruncated = false  
     --    
     ----------------------------------------------------------------------------
     --
-    function s3_bucket:list( delimiter, prefix, max_keys, marker )
+    function s3_bucket:list( delimiter, prefix, max_keys, marker, onComplete )
 
         -- Build the request    
         local httpRequest = {
             method = "GET",
             url = "http://" .. self.host .. "/",
             headers = getHeaders(),
+            proxy = PROXY,
         }
         addAuthorizationHeader(httpRequest.method, self.bucketName, nil, httpRequest.headers)
 
@@ -402,122 +446,123 @@ function M.getBucket( bucketName )
         listParams["marker"]    = marker
         httpRequest.url = appendQueryString(httpRequest.url, listParams)
 
-        -- Create response table and process request
-        
-        local httpResponse = {
-            body = {},
-        }
-        
-        _, httpResponse.code, httpResponse.headers, httpResponse.status = http.request {	
-            url = httpRequest.url,
-            method = httpRequest.method,
-            headers = httpRequest.headers,
-            sink = ltn12.sink.table(httpResponse.body),
-            proxy = PROXY,
-        }
-        httpResponse.body = table.concat(httpResponse.body)
-        
-        dumpHttpRequestResponse(httpRequest, httpResponse)
+        local function createResultStatus( status )
+            if status.isError then
+                dbg("FAIL - bucket:list() request failed, reason: " .. status.errorMessage)
+                dumpHttpRequestResponse(status.request)
+            else
+                dumpHttpRequestResponse(status.request, status.response)
 
-        -- Convert the XML response body to a properly formed table
-        
-        local xmlParser = xml.newParser()
-        local xmlResponse = xmlParser:ParseXmlText(httpResponse.body)
+                -- Convert the XML response body to a properly formed table
+                local xmlParser = xml.newParser()
+                local xmlResponse = xmlParser:ParseXmlText(status.response.body)
+                local bucketList = simplify_xml(xmlResponse)
+                
+                -- Make sure .Contents is always a collection (even if it only has one entry)
+                if bucketList.Contents and bucketList.Contents.Key then
+                    bucketList.Contents = { bucketList.Contents }
+                end
+                
+                -- Make sure .CommonPrefixes is always a collection (even if it has only one entry)
+                if bucketList.CommonPrefixes and bucketList.CommonPrefixes.Prefix  then
+                    bucketList.CommontPrefixes = { bucketList.CommonPrefixes }
+                end
 
-        local result = simplify_xml(xmlResponse)
-        
-        -- Make sure .Contents is always a collection (event if it only has one entry)
-        if result.Contents and result.Contents.Key then
-            result.Contents = { result.Contents }
+                status.bucket = bucketList
+            end
+            
+            return status
         end
         
-        -- Make sure .CommonPrefixes is always a collection (even if it has only one entry)
-        if result.CommonPrefixes and result.CommonPrefixes.Prefix  then
-            result.CommontPrefixes = { result.CommonPrefixes }
+        if onComplete then
+            local function onRequestComplete( status )
+                onComplete(createResultStatus(status))
+            end
+            return asynch_http.request(httpRequest, onRequestComplete)
+        else
+            local status = asynch_http.request(httpRequest)
+            return createResultStatus(status)
         end
         
-        result.response = httpResponse -- Provide the full response detail also
-        return result
     end
     
+    -- Internal helper method for object calls
+    --
+    local function bucket_object_request( bucket, method, objectName, headers, objectData, onComplete )
+
+        local httpRequest = {
+            method = method,
+            url = "http://" .. bucket.host .. "/" .. objectName,
+            headers = getHeaders(headers, objectData),
+            body = objectData,
+            proxy = PROXY,            
+        }
+        addAuthorizationHeader(httpRequest.method, bucket.bucketName, objectName, httpRequest.headers)
+
+        local function createResultStatus( status )
+            if status.isError then
+                dbg("FAIL - bucket request failed, reason: " .. status.errorMessage)
+                dumpHttpRequestResponse(status.request)
+            else
+                dumpHttpRequestResponse(status.request, status.response)
+            end
+            
+            return status
+        end
+        
+        if onComplete then
+            local function onRequestComplete( status )
+                onComplete(createResultStatus(status))
+            end
+            return asynch_http.request(httpRequest, onRequestComplete)
+        else
+            local status = asynch_http.request(httpRequest)
+            return createResultStatus(status)
+        end
+    end
+
     ----------------------------------------------------------------------------
-    -- Method: s3_bucket:get( objectName )
+    -- Method: s3_bucket:head( objectName, requestHeaders, onComplete )
+    --
+    -- See: http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTObjectHEAD.html
+    --
+    ----------------------------------------------------------------------------
+    --
+    function s3_bucket:head( objectName, requestHeaders, onComplete )
+        return bucket_object_request(self, "HEAD", objectName, requestHeaders, nil, onComplete)
+    end
+        
+    ----------------------------------------------------------------------------
+    -- Method: s3_bucket:get( objectName, requestHeaders, onComplete )
     --
     -- See: http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTObjectGET.html
     --
-    -- Returns: Object contents if GET successful, otherwise false
-    --
     ----------------------------------------------------------------------------
     --
-    function s3_bucket:get( objectName )
-    
-        local httpRequest = {
-            method = "GET",
-            url = "http://" .. self.host .. "/" .. objectName,
-            headers = getHeaders(),
-        }
-        addAuthorizationHeader(httpRequest.method, self.bucketName, objectName, httpRequest.headers)
-
-        local httpResponse = { 
-            body = {},
-        }
-        
-        _, httpResponse.code, httpResponse.headers, httpResponse.status = http.request {	
-            url = httpRequest.url,
-            method = httpRequest.method,
-            headers = httpRequest.headers,
-            sink = ltn12.sink.table(httpResponse.body),
-            proxy = PROXY,
-        }
-        httpResponse.body = table.concat(httpResponse.body)
-        
-        dumpHttpRequestResponse(httpRequest, httpResponse)
-        
-        if httpResponse.code == 200 then
-            return httpResponse.body
-        else
-            return false
-        end
-        
+    function s3_bucket:get( objectName, requestHeaders, onComplete )
+        return bucket_object_request(self, "GET", objectName, requestHeaders, nil, onComplete)
     end
 
     ----------------------------------------------------------------------------
-    -- Method: s3_bucket:put( objectName, data )
+    -- Method: s3_bucket:put( objectName, requestHeaders, data, onComplete )
     --
     -- See: http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTObjectPUT.html
     --
-    -- Returns: true if PUT successul, otherwise false
+    ----------------------------------------------------------------------------
+    --
+    function s3_bucket:put( objectName, requestHeaders, data, onComplete )
+        return bucket_object_request(self, "PUT", objectName, requestHeaders, data, onComplete)
+    end
+
+    ----------------------------------------------------------------------------
+    -- Method: s3_bucket:delete( objectName )
+    --
+    -- See: http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTObjectDELETE.html
     --
     ----------------------------------------------------------------------------
     --
-    function s3_bucket:put( objectName, data )
-    
-        local httpRequest = {
-            method = "PUT",
-            url = "http://" .. self.host .. "/" .. objectName,
-            headers = getHeaders(data),
-            body = data,
-        }
-        addAuthorizationHeader(httpRequest.method, self.bucketName, objectName, httpRequest.headers)
-        
-        local httpResponse = { 
-            body = {},
-        }
-        
-        _, httpResponse.code, httpResponse.headers, httpResponse.status = http.request {	
-            url = httpRequest.url,
-            method = httpRequest.method,
-            headers = httpRequest.headers,
-            source = ltn12.source.string(httpRequest.body), 
-            sink = ltn12.sink.table(httpResponse.body),
-            proxy = PROXY,
-        }
-        httpResponse.body = table.concat(httpResponse.body)
-        
-        dumpHttpRequestResponse(httpRequest, httpResponse)
-        
-        return httpResponse.code == 200
-        
+    function s3_bucket:delete( objectName, onComplete )
+        return bucket_object_request(self, "DELETE", objectName, nil, nil, onComplete)
     end
 
     return s3_bucket
@@ -528,7 +573,6 @@ end
 --  Unit tests
 --
 -- =============================================================================================
-
 
 -- Verify the Amazon S3 authorization example from: 
 --
@@ -584,24 +628,171 @@ function M.testSha1Module()
 end
 
 function M.testList(bucket)
-    local result = bucket:list("/", "users/", 100)
-end
-
-function M.testGet(bucket)
-    local result = bucket:get("boulder.png")
-    if result then
-        print("TEST - bucket:get passed, data length: " .. result:len())
+    local status = bucket:list("/", "users/", 100)
+    if status.isError then
+        print("TEST - bucket:get failed with error: " .. status.errorMessage)
     else
-        print("TEST - bucket:get failed")
+        if #status.bucket.Contents >= 2 then
+            if status.bucket.Contents[2].Key == "users/episodes.json" then
+                print("TEST - bucket:get passed, found entry")
+            else
+                print("TEST - bucket:get failed, entry not found")
+            end
+        else
+            print("TEST - bucket:get failed, not enough entries, entry count: " .. #status.bucket.Contents)
+        end
     end
 end
 
-function M.testPut(bucket)
-    local result = bucket:put("test.txt", "This is a test of S3 put")
-    if result then
-        print("TEST - bucket:put passed")
+function M.testListAsync(bucket)
+    local function onComplete( status )
+        if status.isError then
+            print("TEST - async bucket:list failed with error: " .. status.errorMessage)
+        else
+            if #status.bucket.Contents >= 2 then
+                if status.bucket.Contents[2].Key == "users/episodes.json" then
+                    print("TEST - async bucket:list passed, found entry")
+                else
+                    print("TEST - async bucket:list failed, entry not found")
+                end
+            else
+                print("TEST - async bucket:list failed, not enough entries, entry count: " .. #status.bucket.Contents)
+            end
+        end
+    end
+    print("Test - async bucket:list starting")
+    bucket:list("/", "users/", 100, nil, onComplete)
+end
+
+function M.testHead(bucket)
+    local status = bucket:head("boulder.png")
+    if status.isError then
+        print("TEST - bucket:head failed with error: " .. status.errorMessage)
     else
-        print("TEST - bucket:get failed")
+        if status.response.code == 200 then
+            if status.response.headers["content-type"] == "image/png" then
+                print("TEST - bucket:head passed, correct content/type, data length: " .. status.response.body:len())
+            else
+                print("TEST - bucket:head failed, incorrect content type, was: " .. status.response.headers["content-type"])
+            end
+        else
+            print("TEST - bucket:head failed, response code: " .. status.response.code)
+        end        
+    end
+end
+
+function M.testCustomHeaders(bucket)
+    local headers = { }
+    
+    -- First we do a non-matching eTag (specified in a custom request header)
+    --
+    headers["If-Match"] = "non-matching-etag"
+    local status = bucket:head("boulder.png", headers)
+    if status.isError then
+        print("TEST - bucket:head with custom headers failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 412 then -- "412 Precondition Failed" is the expected result
+            print("TEST - bucket:head with custom headers passed for 'Not Found' case")
+        else
+            print("TEST - bucket:head failed, response code: " .. status.response.code)
+        end        
+    end
+    
+    -- Then we do a matching eTag (specified in a custom request header)
+    --
+    headers["If-Match"] = "ea9035ce951323d8c66a3c4dabda9e64"
+    status = bucket:head("boulder.png", headers)
+    if status.isError then
+        print("TEST - bucket:head with custom headers failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 200 then
+            print("TEST - bucket:head with custom headers passed for 'Found' case")
+        else
+            print("TEST - bucket:head failed, response code: " .. status.response.code)
+        end        
+    end
+
+end
+
+function M.testGet(bucket)
+    local status = bucket:get("boulder.png")
+    if status.isError then
+        print("TEST - bucket:get failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 200 then
+            print("TEST - bucket:get passed, data length: " .. status.response.body:len())
+        else
+            print("TEST - bucket:get failed, response code: " .. status.response.code)
+        end        
+    end
+end
+
+function M.testGetAsync(bucket)
+    local function onComplete( status )
+        if status.isError then
+            print("TEST - async bucket:get failed with error: " .. status.errorMessage)
+        else
+            if status.response.code == 200 then
+                print("TEST - async bucket:get passed, data length: " .. status.response.body:len())
+            else
+                print("TEST - async bucket:get failed, response code: " .. status.response.code)
+            end        
+        end
+    end
+    print("Test - async bucket:get starting")
+    bucket:get("boulder.png", nil, onComplete)
+end
+
+function M.testCancelGetAsync(bucket)
+    local function onComplete( status )
+        print("TEST - cancel async bucket:get failed, callback should not have been reached")
+    end
+    print("Test - cancel async bucket:get starting")
+    local http_thread = bucket:get("boulder.png", nil, onComplete)
+    http_thread:cancel()
+    print("Test - cancel async bucket:get ending")
+end
+
+function M.testPut(bucket)
+    local status = bucket:put("test.txt", nil, "This is a test of S3 put")
+    if status.isError then
+        print("TEST - bucket:put failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 200 then
+            print("TEST - bucket:put passed")
+        else
+            print("TEST - bucket:put failed, response code: " .. status.response.code)
+        end        
+    end
+end
+
+function M.testPutAsync(bucket)
+    local function onComplete( status )
+        if status.isError then
+            print("TEST - async bucket:put failed with error: " .. status.errorMessage)
+        else
+            if status.response.code == 200 then
+                print("TEST - async bucket:put passed")
+            else
+                print("TEST - async bucket:put failed, response code: " .. status.response.code)
+            end        
+        end
+    end
+    print("Test - async bucket:put starting")
+    bucket:put("test.txt", nil, "This is a test of S3 put", onComplete)
+end
+
+function M.testDelete(bucket)
+    local status = bucket:delete("test.txt")
+    if status.isError then
+        print("TEST - bucket:put failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 204 then
+            -- Note - for DELETE a "204 No Content" is actually a success
+            print("TEST - bucket:put passed")
+        else
+            print("TEST - bucket:put failed, response code: " .. status.response.code)
+        end        
     end
 end
 
@@ -609,15 +800,24 @@ function M.testAll()
     
     local bucket_name = "smasher"
     local bucket = M.getBucket(bucket_name)
-    
+
     M.testAuthComputation()
     M.testSha1Module()
     
     M.testList(bucket)
-    
+    M.testHead(bucket)
     M.testGet(bucket)
     M.testPut(bucket)
+    M.testDelete(bucket)
 
+    M.testCustomHeaders(bucket)
+
+    M.testListAsync(bucket)
+    M.testGetAsync(bucket)
+    M.testPutAsync(bucket)
+    
+    M.testCancelGetAsync(bucket)
+    
 end
 
 return M
