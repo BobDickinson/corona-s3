@@ -24,7 +24,7 @@ Usage:
     local status = bucket:list("/", "path/", 100)
     print("Found " .. #status.bucket.Contents .. " .. items in bucket")
 
-    -- Put a file, get it back, and delete it
+    -- Write some data to an S3 object, get it back, and delete the object
     --
     bucket:put("path/object.txt", nil, "this is the object contents")
     status = bucket:get("path/object.txt")
@@ -32,3 +32,8 @@ Usage:
         print("Got bucket object contents: " .. status.response.body)
     end    
     bucket:delete("path/object.txt")
+
+    -- Write a file to an S3 object and get a copy back
+    --
+    bucket:put_file("path/object.png", system.pathForFile("boulder.png", system.DocumentsDirectory))
+    bucket:get_file("path/object.png", system.pathForFile("new_boulder.png", system.DocumentsDirectory))
