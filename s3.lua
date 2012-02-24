@@ -48,14 +48,19 @@
 --    local status = bucket:list("/", "path/", 100)
 --    print("Found " .. #status.bucket.Contents .. " .. items in bucket")
 --
---    -- Put a file, get it back, and delete it
+--    -- Write some data to an S3 object, get it back, and delete the object
 --    --
---    bucket:put("path/object.txt", nil, "this is the object contents")
+--    bucket:put("path/object.txt", "this is the object contents")
 --    status = bucket:get("path/object.txt")
 --    if not status.isError and status.response.code = 200 then
 --        print("Got bucket object contents: " .. status.response.body)
 --    end    
 --    bucket:delete("path/object.txt")
+--
+--    -- Write a file to an S3 object and get a copy back
+--    --
+--    bucket:put_file("path/object.png", system.pathForFile("boulder.png", system.DocumentsDirectory))
+--    bucket:get_file("path/object.png", system.pathForFile("new_boulder.png", system.DocumentsDirectory))
 --
 --
 -- Notice: 
@@ -164,9 +169,9 @@ local function addAuthorizationHeader( method, bucketName, objectName, headers )
         end
     end
     
-    local canonicalizedResourceString = "/" .. bucketName:lower() .. "/"
+    local canonicalizedResourceString = "/" .. bucketName .. "/"
     if objectName then
-        canonicalizedResourceString = canonicalizedResourceString .. objectName:lower()
+        canonicalizedResourceString = canonicalizedResourceString .. objectName
     end
     
     local canonicalizedHeaderString = 
@@ -176,6 +181,8 @@ local function addAuthorizationHeader( method, bucketName, objectName, headers )
         .. (headers["Date"] or "") .. "\n"
         .. get_canonical_amz_headers(headers)
         .. canonicalizedResourceString
+        
+    print("Canonicalized header string: " .. canonicalizedHeaderString)
         
     headers["Authorization"] = "AWS " .. M.AWS_Access_Key_ID .. ":" .. mime.b64(sha1_hmac(M.AWS_Secret_Key, canonicalizedHeaderString))
 
@@ -220,6 +227,36 @@ local function appendQueryString( url, params )
         url = url .. queryString
     end
     return url
+end
+
+local function loadFile(filepath, directory)
+    local filepath = filepath
+    if directory then
+        filepath = system.pathForFile(filepath, directory)
+    end
+	local file, err = io.open(filepath, "rb")
+	if file then
+		local data = file:read("*a")
+		io.close(file)
+	    return data
+	else
+		print("Load error on open: ", err)
+	end
+end
+
+local function saveFile(data, filepath, directory)
+    local filepath = filepath
+    if directory then
+        filepath = system.pathForFile(filepath, directory)
+    end
+	local file, err = io.open(filepath, "wb")
+    if file then
+        file:write(data)
+        io.close(file)
+        return true
+    else
+        print("Save error on open: ", err)
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -488,7 +525,7 @@ function M.getBucket( bucketName )
     
     -- Internal helper method for object calls
     --
-    local function bucket_object_request( bucket, method, objectName, headers, objectData, onComplete )
+    local function bucket_object_request( bucket, method, objectName, headers, objectData, responseFilePath, onComplete )
 
         local httpRequest = {
             method = method,
@@ -499,11 +536,18 @@ function M.getBucket( bucketName )
         }
         addAuthorizationHeader(httpRequest.method, bucket.bucketName, objectName, httpRequest.headers)
 
+        local responseFilePath = responseFilePath
+        
         local function createResultStatus( status )
             if status.isError then
                 dbg("FAIL - bucket request failed, reason: " .. status.errorMessage)
                 dumpHttpRequestResponse(status.request)
             else
+                if status.response.code == 200 and status.response.body and responseFilePath then
+                    -- We only want to save the body if it's a valid body response
+                    saveFile(status.response.body, responseFilePath)
+                    status.response.bodyFilePath = responseFilePath
+                end
                 dumpHttpRequestResponse(status.request, status.response)
             end
             
@@ -529,7 +573,7 @@ function M.getBucket( bucketName )
     ----------------------------------------------------------------------------
     --
     function s3_bucket:head( objectName, requestHeaders, onComplete )
-        return bucket_object_request(self, "HEAD", objectName, requestHeaders, nil, onComplete)
+        return bucket_object_request(self, "HEAD", objectName, requestHeaders, nil, nil, onComplete)
     end
         
     ----------------------------------------------------------------------------
@@ -540,7 +584,11 @@ function M.getBucket( bucketName )
     ----------------------------------------------------------------------------
     --
     function s3_bucket:get( objectName, requestHeaders, onComplete )
-        return bucket_object_request(self, "GET", objectName, requestHeaders, nil, onComplete)
+        return bucket_object_request(self, "GET", objectName, requestHeaders, nil, nil, onComplete)
+    end
+
+    function s3_bucket:get_file( objectName, filePath, requestHeaders, onComplete )
+        return bucket_object_request(self, "GET", objectName, requestHeaders, nil, filePath, onComplete)
     end
 
     ----------------------------------------------------------------------------
@@ -550,8 +598,17 @@ function M.getBucket( bucketName )
     --
     ----------------------------------------------------------------------------
     --
-    function s3_bucket:put( objectName, requestHeaders, data, onComplete )
-        return bucket_object_request(self, "PUT", objectName, requestHeaders, data, onComplete)
+    function s3_bucket:put( objectName, data, requestHeaders, onComplete )
+        return bucket_object_request(self, "PUT", objectName, requestHeaders, data, nil, onComplete)
+    end
+
+    function s3_bucket:put_file( objectName, filePath, requestHeaders, onComplete )
+        -- No point in streaming this since we have to get content length and compute the MD5
+        -- digest anyway (and crypto.digest only takes a string).  So we just load the file
+        -- here...
+        --
+        local data = loadFile(filePath)
+        return self:put( objectName, data, requestHeaders, onComplete )
     end
 
     ----------------------------------------------------------------------------
@@ -562,7 +619,7 @@ function M.getBucket( bucketName )
     ----------------------------------------------------------------------------
     --
     function s3_bucket:delete( objectName, onComplete )
-        return bucket_object_request(self, "DELETE", objectName, nil, nil, onComplete)
+        return bucket_object_request(self, "DELETE", objectName, nil, nil, nil, onComplete)
     end
 
     return s3_bucket
@@ -727,6 +784,24 @@ function M.testGet(bucket)
     end
 end
 
+function M.testGetFile(bucket)
+    local filePath = system.pathForFile("dwn_boulder.png", system.DocumentsDirectory)
+    local status = bucket:get_file("boulder.png", filePath)
+    if status.isError then
+        print("TEST - bucket:get_file failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 200 then
+            if status.response.bodyFilePath == filePath then
+                print("TEST - bucket:get_file passed, data length: " .. status.response.body:len())
+            else
+                print("TEST - bucket:get_file failed, incorrect bodyFilePath: ", status.response.bodyFilePath)
+            end
+        else
+            print("TEST - bucket:get_file failed, response code: " .. status.response.code)
+        end        
+    end
+end
+
 function M.testGetAsync(bucket)
     local function onComplete( status )
         if status.isError then
@@ -754,7 +829,20 @@ function M.testCancelGetAsync(bucket)
 end
 
 function M.testPut(bucket)
-    local status = bucket:put("test.txt", nil, "This is a test of S3 put")
+    local status = bucket:put("test.txt", "This is a test of S3 put", nil)
+    if status.isError then
+        print("TEST - bucket:put failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 200 then
+            print("TEST - bucket:put passed")
+        else
+            print("TEST - bucket:put failed, response code: " .. status.response.code)
+        end        
+    end
+end
+
+function M.testPutFile( bucket )
+    local status = bucket:put_file("cover.jpg", system.pathForFile("init_cover.jpeg", system.DocumentsDirectory))
     if status.isError then
         print("TEST - bucket:put failed with error: " .. status.errorMessage)
     else
@@ -779,19 +867,19 @@ function M.testPutAsync(bucket)
         end
     end
     print("Test - async bucket:put starting")
-    bucket:put("test.txt", nil, "This is a test of S3 put", onComplete)
+    bucket:put("test.txt", "This is a test of S3 put", nil, onComplete)
 end
 
 function M.testDelete(bucket)
     local status = bucket:delete("test.txt")
     if status.isError then
-        print("TEST - bucket:put failed with error: " .. status.errorMessage)
+        print("TEST - bucket:delete failed with error: " .. status.errorMessage)
     else
         if status.response.code == 204 then
             -- Note - for DELETE a "204 No Content" is actually a success
-            print("TEST - bucket:put passed")
+            print("TEST - bucket:delete passed")
         else
-            print("TEST - bucket:put failed, response code: " .. status.response.code)
+            print("TEST - bucket:delete failed, response code: " .. status.response.code)
         end        
     end
 end
@@ -807,7 +895,9 @@ function M.testAll()
     M.testList(bucket)
     M.testHead(bucket)
     M.testGet(bucket)
+    M.testGetFile(bucket)
     M.testPut(bucket)
+    M.testPutFile(bucket)
     M.testDelete(bucket)
 
     M.testCustomHeaders(bucket)
@@ -817,7 +907,6 @@ function M.testAll()
     M.testPutAsync(bucket)
     
     M.testCancelGetAsync(bucket)
-    
 end
 
 return M
