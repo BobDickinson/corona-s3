@@ -134,7 +134,6 @@ M.AWS_Secret_Key    = "--UNDEFINED--"
 local function sha1_hmac( key, text )
     -- Corona doesn't support SHA1 (or any other algorithms) on Windows.  We have to go to a
     -- pure Lua implementation of sha1_hmac on Windows so we can test/dev in the simulator.
-    -- Not sure if this is needed on Mac also.
     --
     if system.getInfo("platformName") == "Win" then
         return (sha1.hmac_sha1_binary(key, text))
@@ -163,7 +162,7 @@ local function addAuthorizationHeader( method, bucketName, objectName, headers )
             local header_lines = {}
             for i = 1, #amz_headers do
                 local header = amz_headers[i]
-                header_lines[#header_lines + 1] = header:lower() .. ':' .. headers[header]:lower()
+                header_lines[#header_lines + 1] = header:lower() .. ':' .. headers[header]
             end
             return table.concat(header_lines, "\n") .. "\n"
         end
@@ -182,7 +181,7 @@ local function addAuthorizationHeader( method, bucketName, objectName, headers )
         .. get_canonical_amz_headers(headers)
         .. canonicalizedResourceString
         
-    print("Canonicalized header string: " .. canonicalizedHeaderString)
+    --print("Canonicalized header string: " .. canonicalizedHeaderString)
         
     headers["Authorization"] = "AWS " .. M.AWS_Access_Key_ID .. ":" .. mime.b64(sha1_hmac(M.AWS_Secret_Key, canonicalizedHeaderString))
 
@@ -368,6 +367,13 @@ local function simplify_xml( xml, tbl, indent )
     return tbl
 end
 
+-- We export this so that S3 callers can get the host name for checking connection
+-- status, etc.
+--
+function M.getHostNameFromBucketName( bucketName )
+    return bucketName .. ".s3.amazonaws.com"
+end
+
 --------------------------------------------------------------------------------
 --
 -- The S3 bucket object
@@ -416,7 +422,7 @@ function M.getBucket( bucketName )
 
     local s3_bucket = {
         bucketName = bucketName,
-        host = bucketName .. ".s3.amazonaws.com"
+        host = M.getHostNameFromBucketName(bucketName),
     }
     
     ----------------------------------------------------------------------------
@@ -884,11 +890,43 @@ function M.testDelete(bucket)
     end
 end
 
+function M.testMetaData(bucket)
+    local headers = {}
+    headers["x-amz-meta-user-data"] = "This is user metadata"
+    local status = bucket:put("test.txt", "This is a test of S3 put", headers)
+    if status.isError then
+        print("TEST - metadata - bucket:put failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 200 then
+            print("TEST - metadata - bucket:put passed")
+        else
+            print("TEST - metadata- bucket:put failed, response code: " .. status.response.code)
+        end        
+    end
+    
+    status = bucket:head("test.txt")
+    if status.isError then
+        print("TEST - metadata- bucket:head with custom headers failed with error: " .. status.errorMessage)
+    else
+        if status.response.code == 200 then
+            if status.response.headers["x-amz-meta-user-data"] == "This is user metadata" then
+                print("TEST - metadata - PASSED, metadata response header found")
+            else
+                print("TEST - metadata - FAILED, metadata response header NOT found")
+            end
+        else
+            print("TEST - metadata - bucket:head failed, response code: " .. status.response.code)
+        end        
+    end
+    
+    status = bucket:list("/", "", 100)
+end
+
 function M.testAll()
     
     local bucket_name = "smasher"
     local bucket = M.getBucket(bucket_name)
-
+    
     M.testAuthComputation()
     M.testSha1Module()
     
@@ -901,6 +939,7 @@ function M.testAll()
     M.testDelete(bucket)
 
     M.testCustomHeaders(bucket)
+    M.testMetaData(bucket)
 
     M.testListAsync(bucket)
     M.testGetAsync(bucket)
